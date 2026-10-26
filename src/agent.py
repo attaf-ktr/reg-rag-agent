@@ -29,8 +29,16 @@ llm = ChatGroq(temperature=0, model_name="openai/gpt-oss-120b")
 
 # 4. Prompts
 generate_prompt = PromptTemplate(
-    template="""Tu es un expert de Bank Al-Maghrib. Réponds à la question avec ce contexte :
+    template="""Tu es un assistant strict spécialisé dans la réglementation de Bank Al-Maghrib.
+    
+    RÈGLES ABSOLUES :
+    1. Si l'utilisateur dit juste "bonjour", "salut" ou "hi", réponds poliment : "Bonjour ! Je suis l'agent Bank Al-Maghrib. Quelle est votre question sur la réglementation bancaire ?"
+    2. Pour toute autre question, utilise UNIQUEMENT le contexte ci-dessous.
+    3. Si la réponse n'est pas dans le contexte ou si la question n'a rien à voir avec la banque, refuse de répondre en disant : "Désolé, je ne réponds qu'aux questions sur la réglementation de Bank Al-Maghrib."
+
+    Contexte :
     {context}
+    
     Question: {question}
     Réponse:""",
     input_variables=["context", "question"]

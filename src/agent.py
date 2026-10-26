@@ -18,7 +18,7 @@ class AgentState(TypedDict):
     question: str
     context: List[Document]
     answer: str
-    loop_count: int # Pour éviter les boucles infinies
+    loop_count: int
 
 # 3. Initialiser les outils
 print("⚙️ Initialisation des composants...")
@@ -28,17 +28,28 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 llm = ChatGroq(temperature=0, model_name="openai/gpt-oss-120b")
 
 # 4. Prompts
-generate_prompt = PromptTemplate(
-    template="""Tu es un assistant strict spécialisé dans la réglementation de Bank Al-Maghrib.
+router_prompt = PromptTemplate(
+    template="""Tu es un expert en classification. 
+    Analyse la demande de l'utilisateur.
+    - Si c'est une simple salutation (bonjour, salut, hi, hello) ou une formule de politesse (merci, au revoir), réponds UNIQUEMENT par le mot : BAVARDAGE
+    - Si c'est une vraie question ou une recherche d'information (même floue comme "je veux créer un compte"), réponds UNIQUEMENT par le mot : BANQUE
     
-    RÈGLES ABSOLUES :
-    1. Si l'utilisateur dit juste "bonjour", "salut" ou "hi", réponds poliment : "Bonjour ! Je suis l'agent Bank Al-Maghrib. Quelle est votre question sur la réglementation bancaire ?"
-    2. Pour toute autre question, utilise UNIQUEMENT le contexte ci-dessous.
-    3. Si la réponse n'est pas dans le contexte ou si la question n'a rien à voir avec la banque, refuse de répondre en disant : "Désolé, je ne réponds qu'aux questions sur la réglementation de Bank Al-Maghrib."
+    Demande : {question}
+    Classification :""",
+    input_variables=["question"]
+)
 
-    Contexte :
-    {context}
+generate_prompt = PromptTemplate(
+    template="""Tu es un expert strict spécialisé UNIQUEMENT dans la réglementation de Bank Al-Maghrib (Maroc). 
     
+    RÈGLE D'OR :
+    Réponds à la question en te basant STRICTEMENT sur le contexte fourni. 
+    Si la réponse ne se trouve pas clairement dans le contexte, tu ne dois formuler aucune supposition et répondre EXACTEMENT par la phrase suivante : 
+    "Désolé, cette information ne figure pas dans les circulaires de Bank Al-Maghrib que j'ai en mémoire."
+    
+    N'invente aucune procédure et ne mentionne jamais d'autres pays ou juridictions.
+
+    Contexte : {context}
     Question: {question}
     Réponse:""",
     input_variables=["context", "question"]
@@ -54,14 +65,36 @@ grade_prompt = PromptTemplate(
 )
 
 rewrite_prompt = PromptTemplate(
-    template="""La question suivante n'a pas donné de bons résultats dans notre base de données. 
-    Reformule-la pour qu'elle soit plus précise pour une recherche sémantique. Ne renvoie QUE la nouvelle question.
+    template="""La question suivante n'a pas donné de bons résultats. 
+    Reformule-la pour qu'elle soit plus précise pour une recherche dans des circulaires bancaires de Bank Al-Maghrib (Maroc). 
+    
+    RÈGLE ABSOLUE : Ne mentionne JAMAIS la France ou la réglementation française. La question doit cibler uniquement le droit marocain.
+    Ne renvoie QUE la nouvelle question reformulée.
+    
     Question initiale: {question}
     Nouvelle question:""",
     input_variables=["question"]
 )
 
 # 5. Nœuds (Nodes)
+def route_question(state: AgentState):
+    """Ce n'est pas un nœud standard, c'est la fonction de routage conditionnel."""
+    print("🚦 [Router] Analyse de l'intention de l'utilisateur...")
+    chain = router_prompt | llm
+    result = chain.invoke({"question": state["question"]}).content.strip().upper()
+    
+    if "BAVARDAGE" in result:
+        print("   -> Intention détectée : Salutations/Bavardage")
+        return "chat"
+    else:
+        print("   -> Intention détectée : Question Métier (Banque)")
+        return "retrieve"
+
+def chat_node(state: AgentState):
+    """Gère les salutations sans interroger ChromaDB."""
+    print("💬 [Node: Chat] Réponse directe de courtoisie...")
+    return {"answer": "Bonjour ! Je suis l'agent IA expert en réglementation de Bank Al-Maghrib. Comment puis-je vous aider aujourd'hui ?"}
+
 def retrieve_node(state: AgentState):
     print(f"🔍 [Node: Retrieve] Recherche pour : '{state['question']}'")
     docs = retriever.invoke(state["question"])
@@ -69,15 +102,11 @@ def retrieve_node(state: AgentState):
 
 def grade_documents_node(state: AgentState):
     print("⚖️ [Node: Grade] Évaluation de la pertinence des documents...")
-    # On concatène les textes pour l'évaluation
     docs_text = "\n\n".join([doc.page_content for doc in state["context"]])
     chain = grade_prompt | llm
-    result = chain.invoke({"context": docs_text, "question": state["question"]})
-    
-    # On stocke le score (OUI ou NON) temporairement dans le state ou on l'utilise pour le routage
-    score = result.content.strip().upper()
+    score = chain.invoke({"context": docs_text, "question": state["question"]}).content.strip().upper()
     print(f"   -> Verdict du Juge : {score}")
-    return {"answer": score} # On utilise "answer" temporairement pour passer le score
+    return {"answer": score} 
 
 def rewrite_question_node(state: AgentState):
     print("🔄 [Node: Rewrite] Reformulation de la question...")
@@ -92,32 +121,39 @@ def generate_node(state: AgentState):
     response = chain.invoke({"context": docs_text, "question": state["question"]})
     return {"answer": response.content}
 
-# 6. Routage Conditionnel (Edge)
 def decide_to_generate(state: AgentState):
-    """Décide s'il faut générer la réponse ou reformuler la question."""
-    score = state["answer"]
-    
-    if "OUI" in score:
+    if "OUI" in state["answer"]:
         return "generate"
     else:
-        # Sécurité : on arrête après 3 essais pour ne pas bloquer le système
         if state["loop_count"] >= 3:
             print("⚠️ Limite de boucles atteinte, on génère avec ce qu'on a.")
             return "generate"
         return "rewrite"
 
-# 7. Construire le Graphe
+# 6. Construire le Graphe
 workflow = StateGraph(AgentState)
 
+# Ajouter tous les nœuds
+workflow.add_node("chat", chat_node)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("grade_documents", grade_documents_node)
 workflow.add_node("rewrite_question", rewrite_question_node)
 workflow.add_node("generate", generate_node)
 
-workflow.add_edge(START, "retrieve")
+# Le point d'entrée conditionnel (Le Routeur)
+workflow.add_conditional_edges(
+    START,
+    route_question,
+    {
+        "chat": "chat",
+        "retrieve": "retrieve"
+    }
+)
+
+# Les chemins classiques
+workflow.add_edge("chat", END)
 workflow.add_edge("retrieve", "grade_documents")
 
-# C'est ici que la magie opère : l'embranchement conditionnel
 workflow.add_conditional_edges(
     "grade_documents",
     decide_to_generate,
@@ -127,20 +163,22 @@ workflow.add_conditional_edges(
     }
 )
 
-workflow.add_edge("rewrite_question", "retrieve") # La Boucle (Cycle) !
+workflow.add_edge("rewrite_question", "retrieve")
 workflow.add_edge("generate", END)
 
 app = workflow.compile()
 
 if __name__ == "__main__":
-    print("\n🚀 Lancement de l'Agent Autonome...")
+    print("\n🚀 Lancement de l'Agent Autonome avec Routeur...")
     
-    # On pose une question volontairement ambiguë ou complexe pour tester le juge
-    question = "Je veux arrêter mon contrat bancaire, combien de temps la banque a-t-elle si c'est elle qui décide ?"
+    # Test 1 : Salutation
+    print("\n--- TEST 1 : BAVARDAGE ---")
+    inputs_chat = {"question": "Salut !", "loop_count": 0}
+    result_chat = app.invoke(inputs_chat)
+    print(f"🤖 Agent : {result_chat['answer']}")
     
-    inputs = {"question": question, "loop_count": 0}
-    result = app.invoke(inputs)
-    
-    print("\n" + "="*50)
-    print(f"🤖 Réponse Finale :\n{result['answer']}")
-    print("="*50 + "\n")
+    # Test 2 : Vraie question
+    print("\n--- TEST 2 : QUESTION MÉTIER ---")
+    inputs_bank = {"question": "Quel est le délai de préavis pour clôturer un compte ?", "loop_count": 0}
+    result_bank = app.invoke(inputs_bank)
+    print(f"🤖 Agent : {result_bank['answer']}")
